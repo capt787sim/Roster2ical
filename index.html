@@ -155,10 +155,7 @@
       </div>
     </div>
     <div class="status" id="status"></div>
-    <details id="debugDetails" style="display:none;">
-      <summary>Show debug info (PDF column detection, raw rows)</summary>
-      <pre id="rawText">—</pre>
-    </details>
+    <button class="secondary small" id="startOverBtn" style="display:none;margin-top:10px;">Start again</button>
   </div>
 
   <div class="panel" id="xlsxSettings">
@@ -167,6 +164,7 @@
       <label>Spreadsheet columns (1 = column A)</label>
     </div>
     <div class="settings-grid">
+      <div class="field"><label>UID</label><input type="number" id="setUid" value="1" min="1"></div>
       <div class="field"><label>Task</label><input type="number" id="setTask" value="6" min="1"></div>
       <div class="field"><label>Resource</label><input type="number" id="setResource" value="9" min="1"></div>
       <div class="field"><label>Attendees</label><input type="number" id="setAttendees" value="8" min="1"></div>
@@ -204,7 +202,7 @@
 
   <div class="panel" id="generatePanel">
     <h2>4. Generate calendar file</h2>
-    <button class="good" id="exportBtn" disabled>Download .ics</button>
+    <button class="good" id="exportBtn" disabled>Import Roster</button>
     <div id="genResult"></div>
   </div>
 
@@ -223,8 +221,6 @@ let lastXlsxRows = null; // cached raw spreadsheet rows so xlsx settings can be 
 let loadedKind = null;   // 'pdf' | 'xlsx'
 
 const statusEl = document.getElementById('status');
-const rawTextEl = document.getElementById('rawText');
-const debugDetails = document.getElementById('debugDetails');
 const tableWrap = document.getElementById('tableWrap');
 const countLabel = document.getElementById('countLabel');
 const exportBtn = document.getElementById('exportBtn');
@@ -232,10 +228,24 @@ const previewPanel = document.getElementById('previewPanel');
 const generatePanel = document.getElementById('generatePanel');
 const xlsxSettings = document.getElementById('xlsxSettings');
 
+const startOverBtn = document.getElementById('startOverBtn');
+
 function setStatus(msg, kind){
   statusEl.textContent = msg || '';
   statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  startOverBtn.style.display = (kind === 'err') ? 'inline-block' : 'none';
 }
+
+function startOver(){
+  loadedKind = null;
+  lastXlsxRows = null;
+  events = [];
+  fileInput.value = '';
+  setStatus('');
+  document.getElementById('genResult').innerHTML = '';
+  renderTable();
+}
+startOverBtn.addEventListener('click', startOver);
 
 // ---------- shared helpers ----------
 function pad(n){ return n.toString().padStart(2,'0'); }
@@ -301,7 +311,7 @@ function getGeneralSettings(){
 // =======================================================================
 async function extractWordsFromPdf(file){
   const buf = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+  const pdf = await pdfjsLib.getDocument({data: buf, disableWorker: true}).promise;
   const pages = [];
   for(let p = 1; p <= pdf.numPages; p++){
     const page = await pdf.getPage(p);
@@ -558,10 +568,11 @@ async function handlePdfFile(file){
   const pages = await extractWordsFromPdf(file);
   setStatus('Parsing table structure…');
   const result = parsePdfPages(pages);
-  rawTextEl.textContent = result.debug + `\n\n(roster entries found: ${result.rosterCount})`;
-  debugDetails.style.display = 'block';
   events = result.events;
-  setStatus(`Done. Parsed ${events.length} event${events.length === 1 ? '' : 's'} from PDF — review the table, then export.`, 'ok');
+  const msg = events.length === 0
+    ? 'Parsed 0 events from PDF — no matching appointments were found.'
+    : `Done. Parsed ${events.length} event${events.length === 1 ? '' : 's'} from PDF — review the table, then export.`;
+  setStatus(msg, 'ok');
   renderTable();
 }
 
@@ -610,6 +621,7 @@ function parseFlexibleDate(val){
 function getXlsxColumnSettings(){
   const num = id => parseFloat(document.getElementById(id).value);
   return {
+    uid: Math.round(num('setUid')) - 1,
     task: Math.round(num('setTask')) - 1,
     resource: Math.round(num('setResource')) - 1,
     attendees: Math.round(num('setAttendees')) - 1,
@@ -619,6 +631,26 @@ function getXlsxColumnSettings(){
     offDutyOffset: parseFloat(document.getElementById('setOffDutyOffset').value) || 0,
     subjectPrefix: document.getElementById('setSubjectPrefix').value
   };
+}
+
+// Required header labels for each mapped column — the spreadsheet must have a row where
+// every one of these appears (exact match, case-insensitive) at the expected column position.
+// This is what rejects unrelated spreadsheets (e.g. car-journey logs) that merely happen to
+// have date-shaped values in the same column positions.
+const XLSX_HEADER_TOKENS = {
+  uid: 'id', start: 'start', end: 'end', task: 'task', attendees: 'attendees', resource: 'resource'
+};
+
+function findXlsxHeaderRow(rows, cols){
+  for(let i = 0; i < rows.length; i++){
+    const row = rows[i];
+    const isMatch = Object.keys(XLSX_HEADER_TOKENS).every(key => {
+      const cellText = String(row[cols[key]] ?? '').trim().toLowerCase();
+      return cellText === XLSX_HEADER_TOKENS[key];
+    });
+    if(isMatch) return i;
+  }
+  return -1;
 }
 
 function rowsToRawEvents(rows, cols){
@@ -632,7 +664,8 @@ function rowsToRawEvents(rows, cols){
     const resource = String(row[cols.resource]||'').trim();
     const attendeesRaw = row[cols.attendees];
     const attendees = String(attendeesRaw||'').split(/[,;\n\/]+/).map(s=>s.trim()).filter(Boolean);
-    out.push({task, resource, attendees, start, end});
+    const sourceUid = String(row[cols.uid]||'').trim();
+    out.push({sourceUid, task, resource, attendees, start, end});
   });
   return out;
 }
@@ -653,8 +686,12 @@ function xlsxEventsToUnified(rawEvents, cols){
     descLines.push(`Sim End: ${fmtTimeOnly(evt.end)}`);
     const title = (cols.subjectPrefix || '') + evt.task;
     const uidTask = (evt.task||'').replace(/[^A-Za-z0-9]/g,'').slice(0,24) || 'task';
+    const sourceUid = (evt.sourceUid||'').replace(/[^A-Za-z0-9\-_.]/g,'').slice(0,80);
+    const uid = sourceUid
+      ? `${sourceUid}@roster-tool`
+      : `xlsx-${uidTask}-${reportParts.date}-${i}@roster-tool`;
     return {
-      uid: `xlsx-${uidTask}-${reportParts.date}-${i}@roster-tool`,
+      uid,
       date: reportParts.date, endDate: offDutyParts.date,
       startTime: reportParts.time, endTime: offDutyParts.time,
       title, location: evt.resource,
@@ -667,10 +704,20 @@ function xlsxEventsToUnified(rawEvents, cols){
 function reparseXlsx(){
   if(!lastXlsxRows){ setStatus('Load a spreadsheet first.', 'err'); return; }
   const cols = getXlsxColumnSettings();
-  const raw = rowsToRawEvents(lastXlsxRows, cols);
-  if(raw.length===0){
-    setStatus('No events found with the current column settings — check the numbers above match this file.', 'err');
+
+  const headerIdx = findXlsxHeaderRow(lastXlsxRows, cols);
+  if(headerIdx === -1){
+    setStatus("This doesn't look like a valid roster spreadsheet. Please check the file and try again.", 'err');
     events = [];
+    renderTable();
+    return;
+  }
+  const dataRows = lastXlsxRows.slice(headerIdx + 1);
+
+  const raw = rowsToRawEvents(dataRows, cols);
+  if(raw.length===0){
+    events = [];
+    setStatus('Parsed 0 events from spreadsheet — no matching rows were found.', 'ok');
     renderTable();
     return;
   }
@@ -690,8 +737,12 @@ function handleXlsxFile(file){
       reparseXlsx();
     }catch(err){
       console.error(err);
-      setStatus('Could not parse that spreadsheet: '+err.message, 'err');
+      setStatus("This doesn't look like a valid roster spreadsheet. Please check the file and try again.", 'err');
     }
+  };
+  reader.onerror = () => {
+    console.error(reader.error);
+    setStatus("Couldn't read that file. Please check the file and try again.", 'err');
   };
   reader.readAsArrayBuffer(file);
 }
@@ -796,13 +847,15 @@ exportBtn.addEventListener('click', () => {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'schedule.ics';
+  a.download = 'schedule events';
+  a.target = '_blank';
+  a.rel = 'noopener';
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
   document.getElementById('genResult').innerHTML =
-    `<div class="status ok" style="margin-top:10px;">schedule.ics (${events.length} events) downloaded — open it from Files / Downloads to import into Calendar.</div>`;
+    `<div class="status ok" style="margin-top:10px;">Opening ${events.length} event${events.length === 1 ? '' : 's'} in Calendar…</div>`;
 });
 
 // =======================================================================
@@ -811,8 +864,6 @@ exportBtn.addEventListener('click', () => {
 function resetForNewFile(){
   events = [];
   lastXlsxRows = null;
-  debugDetails.style.display = 'none';
-  rawTextEl.textContent = '—';
   document.getElementById('genResult').innerHTML = '';
   renderTable();
 }
@@ -824,7 +875,7 @@ function handleFile(file){
     loadedKind = 'pdf';
     handlePdfFile(file).catch(err => {
       console.error(err);
-      setStatus('Error reading/parsing PDF: ' + err.message, 'err');
+      setStatus("This doesn't look like a valid roster PDF. Please check the file and try again.", 'err');
     });
   } else if(name.endsWith('.xlsx') || name.endsWith('.xls')){
     loadedKind = 'xlsx';
